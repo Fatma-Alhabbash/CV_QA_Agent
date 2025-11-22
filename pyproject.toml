@@ -1,0 +1,17 @@
+[project]
+name = "cv-qa-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "faiss-cpu>=1.13.0",
+    "fastapi>=0.121.3",
+    "numpy>=2.3.5",
+    "pypdf>=6.3.0",
+    "requests>=2.32.5",
+    "routes>=2.5.1",
+    "services>=0.1.1",
+    "uvicorn>=0.38.0",
+]
