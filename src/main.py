@@ -2,8 +2,8 @@
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes.routes import router, get_service
-from services import CVService
+from src.routes.routes import router, get_service
+from src.services import CVService
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
