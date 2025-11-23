@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any
 
-from services import CVService
+from src.services import CVService
 
 router = APIRouter(prefix="/api")
 
