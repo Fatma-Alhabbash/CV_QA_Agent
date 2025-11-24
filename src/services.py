@@ -12,7 +12,34 @@ import requests
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 log = logging.getLogger(__name__)
+
+def make_session_with_retries(
+    total_retries: int = 3,
+    backoff_factor: float = 1.0,
+    status_forcelist: tuple = (429, 500, 502, 503, 504)
+) -> requests.Session:
+    """
+    Create requests.Session with Retry + HTTPAdapter.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=total_retries,
+        read=total_retries,
+        connect=total_retries,
+        status=total_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=frozenset(["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS"])
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 # Load .env relative to this file (safer)
 env_path = Path(__file__).resolve().parent / ".env"
@@ -29,7 +56,7 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-4.1-mini")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "openai/text-embedding-3-small")
 
 # Request defaults
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15.0"))  # seconds
+REQUEST_TIMEOUT = 60
 
 def get_headers():
     token = os.getenv("GITHUB_TOKEN")
@@ -83,14 +110,30 @@ class CVService:
     def llm_chunk_cv(self) -> None:
         log.info("Requesting LLM to chunk CV into sections...")
         if self.skip_model_calls:
-            # fallback: naive chunking (split by headings heuristically)
             log.info("skip_model_calls=True, using heuristic chunking.")
+            # Very simple fallback: attempt to split by blank lines or headings
             lines = [l.strip() for l in self.cv_text.splitlines() if l.strip()]
-            # very naive: treat long blocks as a single "Section"
-            self.sections = [{"section": "CV", "content": self.cv_text}]
+            if not lines:
+                self.sections = [{"section": "CV", "content": self.cv_text}]
+            else:
+                # group into N-line chunks to avoid huge sections
+                chunk_lines = 20
+                self.sections = []
+                for i in range(0, len(lines), chunk_lines):
+                    block = "\n".join(lines[i:i + chunk_lines])
+                    self.sections.append({"section": f"Part {i//chunk_lines + 1}", "content": block})
+            log.info("Heuristic chunking produced %d sections", len(self.sections))
             return
 
-        headers = self._check_token()
+        # Normal path: call remote chunker with retries and larger timeout
+        try:
+            headers = self._check_token()
+        except RuntimeError as e:
+            log.exception("Token check failed for LLM chunking: %s", e)
+            # fallback to local chunking if token is missing
+            self._fallback_local_chunking()
+            return
+
         messages = [
             {
                 "role": "system",
@@ -104,26 +147,80 @@ class CVService:
         ]
         payload = {"model": CHAT_MODEL, "messages": messages, "max_tokens": 1024, "temperature": 0.0}
 
-        resp = requests.post(CHAT_COMPLETIONS_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+        session = make_session_with_retries(total_retries=3, backoff_factor=2)
         try:
+            log.info("POST %s (timeout=%s)", CHAT_COMPLETIONS_URL, REQUEST_TIMEOUT)
+            resp = session.post(CHAT_COMPLETIONS_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # log and fallback
+            log.exception("Chunking API request failed (will use fallback local chunking): %s", e)
+            # include short response body if present for debugging
+            try:
+                txt = getattr(resp, "text", "")
+                log.debug("Chunking API response body (truncated): %s", txt[:1000])
+            except Exception:
+                pass
+            self._fallback_local_chunking()
+            return
+
+        try:
+            raw = resp.json().get("choices", [])[0]["message"]["content"].strip()
         except Exception:
-            log.exception("Chunking API request failed: status=%s body=%s", resp.status_code, resp.text[:1000])
-            raise
+            # resp may not be JSON or not in expected shape
+            log.exception("Failed to parse chunking response JSON - using fallback")
+            self._fallback_local_chunking()
+            return
 
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-
-        # remove triple-backticks if present
+        # clean possible code fences
         if raw.startswith("```json"):
             raw = raw[7:]
         if raw.endswith("```"):
             raw = raw[:-3]
 
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            log.exception("Failed to JSON.parse LLM output (will fallback). Raw snippet: %s", raw[:1000])
+            self._fallback_local_chunking()
+            return
+
         if not isinstance(parsed, list):
-            raise ValueError("Chunking LLM returned unexpected format (expected list).")
+            log.error("Chunking LLM returned unexpected format: %s", type(parsed))
+            self._fallback_local_chunking()
+            return
+
         self.sections = parsed
         log.info("LLM returned %d sections", len(self.sections))
+
+    def _fallback_local_chunking(self, chunk_chars: int = 1000) -> None:
+        """
+        Simple deterministic chunking fallback: split cv_text into roughly chunk_chars pieces.
+        """
+        try:
+            text = getattr(self, "cv_text", "") or ""
+            if not text:
+                self.sections = [{"section": "CV", "content": ""}]
+                return
+            chunks = []
+            start = 0
+            n = len(text)
+            while start < n:
+                end = min(start + chunk_chars, n)
+                # try to extend to next newline to avoid cutting sentences abruptly
+                if end < n:
+                    nl = text.rfind("\n", start, end)
+                    if nl > start:
+                        end = nl
+                chunk = text[start:end].strip()
+                if chunk:
+                    chunks.append({"section": f"Part {len(chunks)+1}", "content": chunk})
+                start = end
+            self.sections = chunks or [{"section": "CV", "content": text}]
+            log.info("Fallback local chunking produced %d chunks (chunk_chars=%d)", len(self.sections), chunk_chars)
+        except Exception:
+            log.exception("Fallback local chunking failed unexpectedly; using whole CV as single section.")
+            self.sections = [{"section": "CV", "content": text}]
 
     def build_embeddings_and_index(self) -> None:
         log.info("Building embeddings for %d sections", len(self.sections))
